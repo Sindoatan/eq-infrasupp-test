@@ -1,0 +1,296 @@
+---
+- name: Configure Application Server
+  hosts: app
+  become: true
+  vars:
+    # System packages
+    system_packages:
+      - lvm2
+      - docker.io
+      - nfs-common
+      - sssd
+      - sssd-tools
+      - libnss-sss
+      - libpam-sss
+      - sssd-ldap 
+      - acl
+      - freeipa-client
+      - oddjob-mkhomedir
+    # Docker configuration
+    docker_data_root: /app/docker
+    docker_storage_driver: overlay2
+    # LVM configuration
+    lvm_vg_name: appvg
+    lvm_lv_name: applv
+    lvm_mount_point: /app
+    lvm_fs_type: ext4
+    # Domain configuration
+    ipa_domain: "{{ lookup('env', 'IPA_DOMAIN') }}"
+    ipa_realm: "{{ lookup('env', 'IPA_REALM') }}"
+    app_short: app-server
+    ldap_short: ldap-server
+    ipa_server: "ldap-server.{{ ipa_domain }}"
+    ipa_admin_password: "{{ lookup('env', 'IPA_ADMIN_PASSWORD') }}"
+    ladp_ext_ip: "{{ lookup('env', 'LDAP_SERVER_IP') }}"
+    app_ext_ip: "{{ lookup('env', 'APP_SERVER_IP') }}"
+
+  tasks:
+    - name: Set the system hostname
+      ansible.builtin.hostname:
+        name: "{{ app_short }}.{{ ipa_domain }}"
+
+    - name: Configure /etc/hosts
+      blockinfile:
+        path: /etc/hosts
+        block: |
+          {{ ansible_default_ipv4.address }} {{ inventory_hostname }}.{{ ipa_domain }} {{ inventory_hostname }}
+          127.0.0.1 localhost localhost.localdomain localhost4 localhost4.localdomain4
+          ::1 localhost localhost.localdomain localhost6 localhost6.localdomain6
+          {{ ladp_ext_ip }} {{ ldap_short }}.{{ ipa_domain }} {{ ldap_short }}
+        state: present
+        create: yes
+
+    # - name: Update system packages
+    #   apt:
+    #     name: "*"
+    #     state: latest
+    #     update_cache: yes
+      
+    - name: Install required packages
+      apt:
+        name: "{{ system_packages }}"
+        state: present
+        update_cache: yes
+
+    - name: Create physical volume
+      command: pvcreate -ff /dev/sdb
+
+    - name: Create volume group
+      lvg:
+        vg: "{{ lvm_vg_name }}"
+        pvs: /dev/sdb
+        state: present
+    
+    - name: Create logical volume
+      lvol:
+        vg: "{{ lvm_vg_name }}"
+        lv: "{{ lvm_lv_name }}"
+        size: 100%FREE
+        state: present
+
+    - name: Create filesystem
+      filesystem:
+        fstype: "{{ lvm_fs_type }}"
+        dev: "/dev/{{ lvm_vg_name }}/{{ lvm_lv_name }}"
+
+    - name: Create mount point
+      file:
+        path: "{{ lvm_mount_point }}"
+        state: directory
+        mode: '0755'
+
+    - name: Mount filesystem
+      mount:
+        path: "{{ lvm_mount_point }}"
+        src: "/dev/{{ lvm_vg_name }}/{{ lvm_lv_name }}"
+        fstype: "{{ lvm_fs_type }}"
+        state: mounted
+
+    - name: Create Docker directory
+      file:
+        path: "{{ docker_data_root }}"
+        state: directory
+        mode: '0755'
+
+    - name: Configure Docker daemon
+      template:
+        src: daemon.json.j2
+        dest: /etc/docker/daemon.json
+        mode: '0644'
+      notify: restart docker
+
+    - name: Enable and start Docker
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Configure SSSD for LDAP
+      template:
+        src: sssd.conf.j2
+        dest: /etc/sssd/sssd.conf
+        mode: '0600'
+      notify: restart sssd
+
+    - name: Configure PAM for SSSD
+      lineinfile:
+        path: /etc/pam.d/common-session
+        line: "session required pam_mkhomedir.so skel=/etc/skel umask=0077"
+        state: present
+
+    - name: Configure NSS for SSSD
+      lineinfile:
+        path: /etc/nsswitch.conf
+        regexp: '^(passwd|group|shadow):'
+        line: '\1: files sss'
+        state: present
+
+    - name: Wait for FreeIPA server to be ready
+      wait_for:
+        host: "{{ ipa_server }}"
+        port: 443
+        state: started
+        timeout: 300
+      register: ipa_wait
+
+    - name: Download CA certificate
+      get_url:
+        url: "https://{{ ipa_server }}/ipa/config/ca.crt"
+        dest: /etc/ipa/ca.crt
+        validate_certs: no
+      register: ca_download
+
+    - name: Enroll into FreeIPA domain (unattended)
+      command: >
+        ipa-client-install
+        --unattended
+        --domain={{ ipa_domain }}
+        --realm={{ ipa_realm }}
+        --server={{ ipa_server }}
+        --principal=admin
+        --password="{{ ipa_admin_password }}"
+        --mkhomedir
+        --force-join
+        --no-ntp
+        --ca-cert-file=/etc/ipa/ca.crt
+      args:
+        creates: /etc/ipa/default.conf
+
+    - name: Enable mkhomedir feature in authselect
+      command: authselect enable-feature with-mkhomedir
+      args:
+        creates: /etc/security/pam_env.conf  # avoids reapplying if already enabled
+      become: true
+
+    - name: Restart SSSD
+      service:
+        name: sssd
+        state: restarted
+
+    - name: Ensure docker_read group exists
+      group:
+        name: docker_read
+        state: present
+
+    - name: Set up Docker permissions
+      file:
+        path: "{{ docker_data_root }}"
+        state: directory
+        mode: '0775'
+        group: docker
+
+    - name: Add docker_read group to Docker directory
+      acl:
+        path: "{{ docker_data_root }}"
+        entity: docker_read
+        etype: group
+        permissions: 'r-x'
+        state: present
+
+    - name: Add docker_write group to Docker directory
+      acl:
+        path: "{{ docker_data_root }}"
+        entity: docker_write
+        etype: group
+        permissions: rwx
+        state: present
+
+    - name: Create home directory for existing users
+      file:
+        path: "/home/{{ item }}"
+        state: directory
+        owner: "{{ item }}"
+        group: "{{ item }}"
+        mode: '0750'
+      loop:
+        - user1
+        - user2
+        - user3
+        - reviewer
+      become: true
+
+    - name: Configure SSH for reviewer user
+      block:
+        - name: Create .ssh directory
+          file:
+            path: /home/reviewer/.ssh
+            state: directory
+            mode: '0700'
+            owner: reviewer
+            group: reviewer
+
+        - name: Set up SSH host key verification
+          blockinfile:
+            path: /home/reviewer/.ssh/config
+            create: yes
+            mode: '0600'
+            owner: reviewer
+            group: reviewer
+            block: |
+              Host *
+                StrictHostKeyChecking no
+                UserKnownHostsFile /dev/null
+                PasswordAuthentication yes
+                PubkeyAuthentication yes
+
+        - name: Set correct permissions for SSH config
+          file:
+            path: /home/reviewer/.ssh/config
+            mode: '0600'
+            owner: reviewer
+            group: reviewer
+
+    - name: Configure SSH access
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        line: "{{ item }}"
+        state: present
+      with_items:
+        - "PasswordAuthentication yes"
+        - "PubkeyAuthentication yes"
+        - "PermitRootLogin yes"
+        - "UsePAM yes"
+        - "ChallengeResponseAuthentication yes"
+      notify: restart sshd
+
+    - name: Ensure PAM is configured for SSH
+      lineinfile:
+        path: /etc/pam.d/sshd
+        line: "{{ item }}"
+        state: present
+      with_items:
+        - "auth       required     pam_unix.so"
+        - "account    required     pam_unix.so"
+        - "session    required     pam_unix.so"
+      notify: restart sshd
+
+    - name: Restart SSH service
+      service:
+        name: sshd
+        state: restarted
+
+  handlers:
+    - name: restart docker
+      systemd:
+        name: docker
+        state: restarted
+
+    - name: restart sssd
+      systemd:
+        name: sssd
+        state: restarted 
+    
+    - name: restart sshd
+      systemd:
+        name: sshd
+        state: restarted

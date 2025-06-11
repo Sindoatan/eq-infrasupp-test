@@ -1,0 +1,436 @@
+---
+- name: Configure LDAP Server
+  hosts: ldap
+  become: true
+  vars:
+    # FreeIPA configuration
+    ipa_domain: "{{ lookup('env', 'IPA_DOMAIN') }}"
+    ipa_short: "{{ lookup('env', 'IPA_SHORT') }}"
+    ipa_realm: "{{ lookup('env', 'IPA_REALM') }}"
+    ipa_realm_service: "{{ ipa_realm | replace('.', '-') }}"
+    service_unit: "dirsrv@{{ ipa_realm_service }}.service"
+    ipa_fqdn: "{{ inventory_hostname }}.{{ lookup('env', 'IPA_DOMAIN') }}"
+    ipa_admin_password: "{{ lookup('env', 'IPA_ADMIN_PASSWORD') }}"
+    ipa_ds_password: "{{ lookup('env', 'IPA_DS_PASSWORD') }}"
+    ladp_ext_ip: "{{ lookup('env', 'LDAP_SERVER_IP') }}"
+    app_ext_ip: "{{ lookup('env', 'APP_SERVER_IP') }}"
+    app_short: app-server
+    # SSH keys directory
+    ssh_keys_dir: "/root/ssh_keys"
+    # LDAP users configuration
+    ldap_users:
+      - name: user1
+        givenname: "User"
+        sn: "One"
+        password: "{{ lookup('env', 'USER1_PASSWORD') }}"
+        groups: ["ssh_users", "docker_read"]
+      - name: user2
+        givenname: "User"
+        sn: "Two"
+        password: "{{ lookup('env', 'USER2_PASSWORD') }}"
+        groups: ["ssh_users", "docker_write"]
+      - name: user3
+        givenname: "User"
+        sn: "Three"
+        password: "{{ lookup('env', 'USER3_PASSWORD') }}"
+        groups: ["ssh_users", "docker_read", "docker_write"]
+      - name: reviewer
+        givenname: "Reviewer"
+        sn: "User"
+        password: "{{ lookup('env', 'REVIEWER_PASSWORD') }}"
+        groups: ["ssh_users", "docker_read", "docker_write"] 
+  tasks:
+
+    # - name: Update system packages
+    #   dnf:
+    #     name: "*"
+    #     state: latest
+    #     update_cache: yes
+    #     disable_gpg_check: yes
+
+    - name: Install required packages
+      dnf:
+        name:
+          - freeipa-server
+          - freeipa-server-dns
+          - bind
+          - bind-dyndb-ldap
+          - python3-pip
+        state: present
+
+    - name: Get current hostname
+      command: hostname
+      register: current_hostname
+      changed_when: false
+
+    - name: Debug current hostname
+      debug:
+        var: current_hostname.stdout
+
+    - name: Debug FQDN
+      debug:
+        msg: "The FQDN for the IPA server is: {{ ipa_fqdn }}"
+
+    - name: Set hostname
+      hostname:
+        name: "{{ ipa_fqdn }}"
+
+    - name: Get new hostname
+      command: hostname
+      register: new_hostname
+      changed_when: false
+
+    - name: Debug new hostname
+      debug:
+        var: new_hostname.stdout
+
+    - name: Remove Google-added hosts entry
+      lineinfile:
+        path: /etc/hosts
+        state: absent
+        regexp: '^10\.0\.0\.(?:[1-9]|1\d\d|2[0-4]\d|25[0-4]) ldap-server\.us-central1-a\.c\.eq-infrasupp-test-02\.internal'
+
+    - name: Configure /etc/hosts
+      blockinfile:
+        path: /etc/hosts
+        block: |
+          {{ ansible_default_ipv4.address }} {{ inventory_hostname }}.{{ ipa_domain }} {{ inventory_hostname }}
+          127.0.0.1 localhost localhost.localdomain localhost4 localhost4.localdomain4
+          ::1 localhost localhost.localdomain localhost6 localhost6.localdomain6
+          {{ app_ext_ip }} {{ app_short }}.{{ ipa_domain }} {{ app_short }}
+        state: present
+        create: yes
+
+    - name: Ensure FreeIPA server entry is present
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ ansible_default_ipv4.address }} ldap-server.ipa.sindoatan.ru ldap-server"
+        state: present
+
+    - name: Debug /etc/hosts content
+      command: cat /etc/hosts
+      register: hosts_content
+      changed_when: false
+
+    - name: Show /etc/hosts content
+      debug:
+        var: hosts_content.stdout
+
+    - name: Verify hostname resolves correctly
+      ansible.builtin.command: hostname --fqdn
+      register: fqdn_result
+
+    - name: Fail if hostname is still incorrect
+      ansible.builtin.fail:
+        msg: "Hostname is not set correctly: {{ fqdn_result.stdout }}"
+      when: fqdn_result.stdout != 'ldap-server.ipa.sindoatan.ru'
+      
+    - name: Configure firewall for FreeIPA
+      firewalld:
+        service: freeipa-ldap
+        permanent: yes
+        state: enabled
+        immediate: yes
+
+    - name: Configure firewall for FreeIPA-ldaps
+      firewalld:
+        service: freeipa-ldaps
+        permanent: yes
+        state: enabled
+        immediate: yes
+
+    - name: Configure firewall for DNS
+      firewalld:
+        service: dns
+        permanent: yes
+        state: enabled
+        immediate: yes
+
+    - name: Configure firewall for Kerberos
+      firewalld:
+        service: kerberos
+        permanent: yes
+        state: enabled
+        immediate: yes
+
+    - name: Configure firewall for HTTPS
+      firewalld:
+        service: https
+        permanent: yes
+        state: enabled
+        immediate: yes
+
+    - name: Configure FreeIPA server
+      command: >
+        ipa-server-install
+          --setup-dns
+          --hostname={{ inventory_hostname }}.{{ ipa_domain }}
+          --domain={{ ipa_domain }}
+          --realm={{ ipa_realm }}
+          --admin-password={{ ipa_admin_password }}
+          --ds-password={{ ipa_ds_password }}
+          --forwarder=8.8.8.8
+          --reverse-zone=0.0.10.in-addr.arpa.
+          --ntp-server=0.pool.ntp.org
+          --ntp-server=1.pool.ntp.org
+          --unattended
+      args:
+        creates: /etc/ipa/default.conf
+      register: ipa_install
+      changed_when: true
+      failed_when: false
+
+    - name: Debug IPA install output
+      debug:
+        var: ipa_install
+        verbosity: 1
+
+    - name: Wait for LDAP service to be available
+      wait_for:
+        host: localhost
+        port: 389
+        state: started
+        timeout: 300
+      register: ldap_wait
+
+    - name: Install pexpect Python library
+      pip:
+        name: pexpect
+        state: present
+      become: true
+      
+    - name: Get Kerberos ticket for IPA admin
+      expect:
+        command: kinit admin
+        responses:
+          (?i)password: "{{ ipa_admin_password }}"
+      become: true
+
+    - name: Check if FreeIPA is installed
+      stat:
+        path: /usr/bin/ipa  # Adjust the path if necessary
+      register: ipa_installed
+
+    - name: Set global FreeIPA password policy to 10 years
+      command: ipa pwpolicy-mod --maxlife=3650
+      when: ipa_installed.stat.exists
+
+    - name: Create LDAP groups
+      ipa_group:
+        name: "{{ item }}"
+        ipa_user: "admin"
+        ipa_pass: "{{ ipa_admin_password }}"
+        state: present
+      with_items:
+        - ssh_users
+        - docker_read
+        - docker_write
+        - admins
+
+    - name: Create LDAP users
+      ipa_user:
+        name: "{{ item.name }}"
+        password: "{{ item.password }}"
+        givenname: "{{ item.givenname }}"
+        sn: "{{ item.sn }}"
+        ipa_user: "admin"
+        ipa_pass: "{{ ipa_admin_password }}"
+        state: present
+      with_items: "{{ ldap_users }}"
+
+    - name: Add users to groups
+      ipa_group:
+        name: "{{ group }}"
+        user: "{{ user.name }}"
+        ipa_user: "admin"
+        ipa_pass: "{{ ipa_admin_password }}"
+        state: present
+      loop: "{{ ldap_users | subelements('groups') }}"
+      vars:
+        user: "{{ item.0 }}"
+        group: "{{ item.1 }}"
+
+    - name: Ensure reviewer is in admins group
+      ipa_group:
+        name: admins
+        user:
+          - admin
+          - reviewer
+        ipa_user: "admin"
+        ipa_pass: "{{ ipa_admin_password }}"
+        state: present
+
+    - name: Create or update allow_all HBAC rule
+      community.general.ipa_hbacrule:
+        name: allow_all
+        description: "Allow all users to access any host via any service"
+        hostcategory: all
+        servicecategory: all
+        usercategory: all
+        state: present
+        ipa_user: "admin"
+        ipa_pass: "{{ ipa_admin_password }}"
+
+    - name: Create or update users SSH access HBAC rule
+      community.general.ipa_hbacrule:
+        name: users SSH to app
+        description: "Allow users to access app host via SSH"
+        hostcategory: all
+        service: ssh
+        user: reviewer,user1,user2,user3 
+        state: present
+        ipa_user: "admin"
+        ipa_pass: "{{ ipa_admin_password }}"
+
+    - name: Configure SSH access
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        line: "{{ item }}"
+        state: present
+      with_items:
+        - "PasswordAuthentication yes"
+        - "PubkeyAuthentication yes"
+        - "PermitRootLogin yes"
+        - "UsePAM yes"
+        - "ChallengeResponseAuthentication yes"
+      notify: restart sshd
+
+    - name: Ensure PAM is configured for SSH
+      lineinfile:
+        path: /etc/pam.d/sshd
+        line: "{{ item }}"
+        state: present
+      with_items:
+        - "auth       required     pam_unix.so"
+        - "account    required     pam_unix.so"
+        - "session    required     pam_unix.so"
+      notify: restart sshd
+
+    - name: Verify LDAP service is running
+      service:
+        name: "{{ service_unit }}"
+        state: started
+        enabled: yes
+      register: ldap_service
+
+    - name: Debug LDAP service status
+      debug:
+        var: ldap_service
+        verbosity: 1
+
+    - name: Check LDAP port
+      wait_for:
+        host: localhost
+        port: 389
+        state: started
+        timeout: 30
+      register: ldap_port
+      ignore_errors: yes
+      
+    - name: Debug LDAP port status
+      debug:
+        var: ldap_port
+        verbosity: 1
+
+    - name: Enable mkhomedir feature in authselect
+      command: authselect enable-feature with-mkhomedir
+      args:
+        creates: /etc/security/pam_env.conf  # avoids reapplying if already enabled
+      become: true
+
+    - name: Create home directory for existing users
+      file:
+        path: "/home/{{ item }}"
+        state: directory
+        owner: "{{ item }}"
+        group: "{{ item }}"
+        mode: '0750'
+      loop:
+        - user1
+        - user2
+        - user3
+        - reviewer
+      become: true
+
+    - name: Configure SSH for reviewer user
+      block:
+        - name: Create .ssh directory
+          file:
+            path: /home/reviewer/.ssh
+            state: directory
+            mode: '0700'
+            owner: reviewer
+            group: reviewer
+
+        - name: Set up SSH host key verification
+          blockinfile:
+            path: /home/reviewer/.ssh/config
+            create: yes
+            mode: '0600'
+            owner: reviewer
+            group: reviewer
+            block: |
+              Host *
+                StrictHostKeyChecking no
+                UserKnownHostsFile /dev/null
+                PasswordAuthentication yes
+                PubkeyAuthentication yes
+
+        - name: Set correct permissions for SSH config
+          file:
+            path: /home/reviewer/.ssh/config
+            mode: '0600'
+            owner: reviewer
+            group: reviewer
+
+    - name: Create SSH keys directory
+      file:
+        path: "{{ ssh_keys_dir }}"
+        state: directory
+        mode: '0700'
+      become: true
+
+    - name: Generate SSH key pairs for users
+      command: "ssh-keygen -t rsa -b 4096 -f {{ ssh_keys_dir }}/{{ item.name }} -N ''"
+      loop: "{{ ldap_users }}"
+      become: true
+      changed_when: true
+
+    - name: Read generated public keys
+      slurp:
+        src: "{{ ssh_keys_dir }}/{{ item.name }}.pub"
+      loop: "{{ ldap_users }}"
+      register: public_keys
+      become: true
+
+    - name: Add SSH public keys to users
+      ipa_user:
+        name: "{{ item.0.name }}"
+        sshpubkey: "{{ item.1.content | b64decode }}"
+        ipa_user: "admin"
+        ipa_pass: "{{ ipa_admin_password }}"
+        state: present
+      loop: "{{ ldap_users | zip(public_keys.results) | list }}"
+      when: public_keys.results is defined
+
+    - name: Set correct permissions for SSH keys
+      file:
+        path: "{{ ssh_keys_dir }}/{{ item.name }}"
+        mode: '0600'
+        owner: root
+        group: root
+      loop: "{{ ldap_users }}"
+      become: true
+
+    - name: Create archive of SSH keys
+      archive:
+        path: "{{ ssh_keys_dir }}"
+        dest: "/root/ssh_keys.tar.gz"
+        format: gz
+      become: true
+
+  handlers:
+    - name: restart sshd
+      service:
+        name: sshd
+        state: restarted

@@ -1,0 +1,15 @@
+[sssd]
+domains = ipa.sindoatan.ru
+services = nss, pam
+
+[domain/ipa.sindoatan.ru]
+id_provider = ldap
+auth_provider = ldap
+ldap_uri = ldap://{{ hostvars[groups['ldap'][0]]['ansible_host'] }}
+ldap_search_base = dc=ipa,dc=sindoatan,dc=ru
+ldap_id_use_start_tls = True
+cache_credentials = True
+ldap_tls_cacert = /etc/ipa/ca.crt
+
+[nss]
+filter_users = root,named,avahi,haldaemon,dbus,radiusd,news,nscd 

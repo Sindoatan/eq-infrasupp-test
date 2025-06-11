@@ -1,0 +1,21 @@
+---
+# Docker configuration
+docker_data_root: /app/docker
+docker_storage_driver: overlay2
+
+# LVM configuration
+lvm_vg_name: appvg
+lvm_lv_name: applv
+lvm_mount_point: /app
+lvm_fs_type: ext4
+
+# System packages
+system_packages:
+  - lvm2
+  - docker.io
+  - nfs-common
+  - sssd
+  - sssd-tools
+  - libnss-sss
+  - libpam-sss
+  - sssd-ldap 

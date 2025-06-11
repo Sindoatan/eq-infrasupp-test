@@ -1,0 +1,29 @@
+---
+# FreeIPA configuration
+ipa_domain: ipa.sindoatan.ru
+ipa_realm: IPA.SINDOATAN.RU
+ipa_admin_password: "{{ vault_ipa_admin_password }}"
+ipa_ds_password: "{{ vault_ipa_ds_password }}"
+
+# LDAP users configuration
+ldap_users:
+  - name: user1
+    first: User
+    last: One
+    password: "{{ vault_user1_password }}"
+    groups: [docker_read]
+  - name: user2
+    first: User
+    last: Two
+    password: "{{ vault_user2_password }}"
+    groups: [docker_write]
+  - name: user3
+    first: User
+    last: Three
+    password: "{{ vault_user3_password }}"
+    groups: [docker_rw]
+  - name: reviewer
+    first: Reviewer
+    last: User
+    password: "{{ vault_reviewer_password }}"
+    groups: [docker_admin] 

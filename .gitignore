@@ -1,0 +1,26 @@
+# Key files
+service-account.json
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform/
+.terraform.lock.hcl
+eq-infrasupp-test-admin
+eq-infrasupp-test-admin.pub
+keys/
+
+# Environment files
+.env
+*.env
+
+# Local development
+.vscode/
+.idea/
+*.log
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Ignore facts directory
+/ansible/facts/
