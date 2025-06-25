@@ -1,2 +1,2 @@
 ansible/facts/
-terraform/terraform
+terraform/.terraform/
